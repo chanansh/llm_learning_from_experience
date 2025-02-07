@@ -1,0 +1,5 @@
+artifacts/ filter=lfs diff=lfs merge=lfs -text
+results/ filter=lfs diff=lfs merge=lfs -text
+results/2008 filter=lfs diff=lfs merge=lfs -text
+artifacts/2008 filter=lfs diff=lfs merge=lfs -text
+artifacts/2010 filter=lfs diff=lfs merge=lfs -text

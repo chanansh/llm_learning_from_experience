@@ -1,0 +1,4 @@
+Please choose between
+
+{H} with probabiltiy {ph}                       |   {S} with certinty 
+{L} otherwise (with probability {pl})           |   
