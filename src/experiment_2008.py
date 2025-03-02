@@ -4,15 +4,23 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 from langgraph.graph import StateGraph
 from llm import get_memory_graph, invoke_graph
 from loguru import logger
 import fire
+
 # Configure logging
+logger.add("experiment.log", 
+           format="{time} {level} {message}", 
+           level="INFO", 
+           backtrace=True, 
+           diagnose=True, 
+           mode="w")
 
 @dataclass
 class ExperimentSettings:
+    """Settings for running the experiment."""
     instructions: str = (
         """
         You are a Technion student participating in a paid experiment.
@@ -26,18 +34,19 @@ class ExperimentSettings:
         """
     )
     new_game: str = "New Game (may differ from previous ones)"
-    trial_instruction: str = "Choose now by replying 'LEFT' or 'RIGHT' only. No other output is allowed!"
+    trial_instruction: str = "Please reply with 'LEFT' or 'RIGHT'."
     trial_payoff_template: str = "You won {points} points (you chose {chosen_button})."
     end_game_template: str = "End of game. You won {points} points."
-    do_not_respond: str = "No response expected. Reply with an empty string."
+    do_not_respond: str = "Please respond with an empty string."
     summary_prompt: str = "Summarize game rewards concisely to aid decision-making."
     n_trials: int = 100
-    model: str = "gpt-4o-mini" # gpt-4o, gpt-4o-mini
+    model: str = "gpt-4o"
     data_file: str = "artifacts/2008/estimation_data.csv"
     output_path: str = "results/2008"
-    seed:int = 42
+    seed: int = 42
     llm_per_problem: bool = True
-    n_jobs = -1
+    checkpoint_per_problem: bool = True  # NEW FLAG: True = per problem, False = per subject
+    n_jobs: int = 4
 
 def load_data(settings: ExperimentSettings) -> pd.DataFrame:
     """Load and preprocess experiment data."""
@@ -45,143 +54,134 @@ def load_data(settings: ExperimentSettings) -> pd.DataFrame:
     df = pd.read_csv(settings.data_file, index_col=0)
     return df.drop(['Choice', 'Payoff'], axis=1).groupby(["Id", "Order"]).first().reset_index()
 
-def parse_decision(content: str) -> str:
-    """Parse the decision from the content."""
-    return "left" if "left" in content.lower() else "right" if "right" in content else None
+def parse_decision(content: str) -> Optional[str]:
+    """Parse the decision from the content string."""
+    content_lower = content.lower()
+    if "left" in content_lower:
+        return "left"
+    elif "right" in content_lower:
+        return "right"
+    return None
 
-def run_trial(app: StateGraph, settings: ExperimentSettings, problem: pd.Series, risky_side: str) -> dict:
-    """Execute a single trial."""
-    choice = get_choice(app, settings)
-    points = (
-        np.random.choice([problem.Low, problem.High], p=[1 - problem.Phigh, problem.Phigh])
-        if choice == risky_side else problem.Medium
-    )
-    
-    trial_payoff_message = settings.trial_payoff_template.format(points=points, chosen_button=choice)
-    invoke_graph(app, trial_payoff_message + "\n" + settings.do_not_respond)
-    
-    return {
-        **problem.to_dict(),
-        "risky_side": risky_side,
-        "side": choice,
-        "Choice": int(choice == risky_side),  # 1 if risky side, else 0
-        "Payoff": points,
-    }
+def get_choice(app: StateGraph, settings: ExperimentSettings, initial_response: Optional[str] = None, max_retry: int = 3) -> str:
+    """Obtain the choice from the user with retries, optionally using an initial response."""
+    if initial_response:
+        choice = parse_decision(initial_response.strip().lower())
+        if choice:
+            return choice  # If valid, return immediately
 
-def get_choice(app, settings, max_retry:int=3):
-    """Get the choice from the user.
-    Args:
-        app: The memory graph application.
-        settings: The experiment settings.
-        max_retry: The maximum number of retries.
-    Returns:
-        Tuple[str, Optional[str]]: The content and choice.
-    Raises:
-        ValueError: If an invalid response is received after max_retry attempts.
-    """
-    content = invoke_graph(app, settings.trial_instruction).strip().lower()
-    choice = parse_decision(content)
-    # retry if invalid response
-    for i_try in range(max_retry):
-        if choice is not None:
-            break
-        logger.warning(f"Invalid response received: {content}. retrying {i_try + 1}/{max_retry} ...")
+    for attempt in range(max_retry):
         content = invoke_graph(app, settings.trial_instruction).strip().lower()
         choice = parse_decision(content)
-    if choice is None:
-        logger.error(f"Invalid response received: {content}")
-        raise ValueError(f"Invalid response: {content}")
-    return choice
+        if choice:
+            return choice
+        logger.warning(f"Invalid response received: {content}. Retrying {attempt + 1}/{max_retry}...")
 
+    logger.error(f"Max retries reached. Last response: {content}")
+    raise ValueError(f"Invalid response after {max_retry} attempts: {content}")
 
-def run_problem(app: StateGraph, 
-                settings: ExperimentSettings, 
-                problem: pd.Series,
-                message: str | None = None) -> list:
-    """Execute all trials for a given problem."""
-    if settings.llm_per_problem:
-        if app is not None:
-            raise ValueError("LLM per problem is enabled. App should be None.")
-        logger.info("LLM per problem is enabled so initializing the app at problem level.")
-        app = get_memory_graph(
-            model=settings.model, 
-            summary_prompt=settings.summary_prompt,
-            system_prompt=settings.instructions + "\n" + settings.do_not_respond)
-    risky_side = np.random.choice(["left", "right"])
-    logger.info(f"Risky side: {risky_side}")
-    invoke_graph(app, settings.new_game + "\n" + settings.do_not_respond)
-
-    total_points = 0
+def run_problem(app: Optional[StateGraph], settings: ExperimentSettings, problem: pd.Series, subject_id: int, problem_number: int) -> List[dict]:
+    """Run all trials for a given problem while minimizing LLM calls."""
     results = []
-    
-    for trial_num in tqdm(range(settings.n_trials), desc="Trials"):
-        logger.info(f"Trial {trial_num + 1}/{settings.n_trials} [{message}]")
-        trial_result = run_trial(app, settings, problem, risky_side)
-        total_points += trial_result["Payoff"]
-        trial_result.update({"total_points": total_points, "Trial": trial_num + 1})
+    total_points = 0
+    risky_side = np.random.choice(["left", "right"])
+
+    if (app is None) or settings.llm_per_problem:
+        app = get_memory_graph(
+            model=settings.model,
+            summary_prompt=settings.summary_prompt,
+            system_prompt=settings.instructions
+        )
+
+    # Start the game and ask for the first decision
+    first_response = invoke_graph(app, f"{settings.new_game}\n{settings.trial_instruction}").strip().lower()
+    choice = get_choice(app, settings, initial_response=first_response)
+
+    for trial_num in tqdm(range(settings.n_trials), desc=f"Subject {subject_id}, Problem {problem_number}"):
+        points = (
+            np.random.choice([problem.Low, problem.High], p=[1 - problem.Phigh, problem.Phigh])
+            if choice == risky_side else problem.Medium
+        )
+
+        trial_payoff_message = settings.trial_payoff_template.format(points=points, chosen_button=choice)
+        total_points += points
+
+        trial_result = {
+            **problem.to_dict(),
+            "risky_side": risky_side,
+            "side": choice,
+            "Choice": int(choice == risky_side),  # 1 if risky side, else 0
+            "Payoff": points,
+            "total_points": total_points,
+            "Trial": trial_num + 1
+        }
         results.append(trial_result)
-    
+
+        # No need to ask for a choice after the last trial
+        if trial_num < settings.n_trials - 1:
+            response = invoke_graph(app, f"{trial_payoff_message}\n{settings.trial_instruction}").strip().lower()
+            choice = get_choice(app, settings, initial_response=response)
+
+        else:
+            invoke_graph(app, settings.end_game_template.format(points=total_points))
+
     return results
 
+def run_subject(settings: ExperimentSettings, df_id: pd.DataFrame, subject_id: int):
+    """Run the experiment for a single subject with optional per-problem checkpointing."""
+    if not settings.checkpoint_per_problem:
+        # Check if the full subject file exists
+        output_file = os.path.join(settings.output_path, f"{subject_id}.csv")
+        if os.path.exists(output_file):
+            logger.info(f"Skipping completed subject {subject_id}")
+            return
+    
+    # Initialize LLM app at subject level if needed
+    app = None if settings.llm_per_problem else get_memory_graph(
+        model=settings.model,
+        summary_prompt=settings.summary_prompt,
+        system_prompt=settings.instructions
+    )
 
-def run_subject(settings: ExperimentSettings, 
-                df_id: pd.DataFrame, 
-                subject_id: int):
-    """Execute all problems for a given subject."""
-    if settings.llm_per_problem:
-        logger.info("LLM per problem is enabled so no need to initialize the app at subject level.")
-        app = None
-    else:
-        logger.info("LLM per problem is disabled so initializing the app at subject level.")
-        app = get_memory_graph(
-            model=settings.model, 
-            summary_prompt=settings.summary_prompt,
-            system_prompt=settings.instructions + "\n" + settings.do_not_respond)
-    subject_results = []
-    #invoke_graph(app, settings.instructions + "\n" + settings.do_not_respond)
-    
-    for iproblem, (_, problem) in tqdm(enumerate(df_id.iterrows()), desc=f"Subject {subject_id} - Problems"):
-        logger.info(f"Running problem {problem.Problem} for subject {subject_id} ({iproblem + 1}/{len(df_id)})")
-        message = f"Running subject {subject_id} - Problem {problem.Problem} ({iproblem + 1}/{len(df_id)})"
-        problem_results = run_problem(app, settings, problem, message)
-        subject_results.extend(problem_results)
-    
-    return subject_results
-       
-def get_subject_to_run_on(settings, unique_subjects):
-    """Determine which subjects have not been processed yet."""
-    existing_files = {f.split(".")[0] for f in os.listdir(settings.output_path) if f.endswith(".csv")}
-    return [subj for subj in unique_subjects if str(subj) not in existing_files]
+    all_results = []
 
-def process_subject(settings, df_id, subject_id):
-    """Process a single subject and save results to a unique file."""
-    logger.info(f"Starting subject {subject_id}")
-    subject_results = run_subject(settings, df_id, subject_id)
-    output_file = os.path.join(settings.output_path, f"{subject_id}.csv")
-    
-    pd.DataFrame(subject_results).to_csv(output_file, index=False)
-    
-    logger.info(f"Completed subject {subject_id}")
+    for problem_number, (_, problem) in tqdm(enumerate(df_id.iterrows()), total=len(df_id), desc=f"Subject {subject_id} - Problems"):
+        
+        # Check if the problem is already processed if checkpointing per problem
+        problem_file = os.path.join(settings.output_path, f"{subject_id}_{problem_number}.csv")
+        if settings.checkpoint_per_problem and os.path.exists(problem_file):
+            logger.info(f"Skipping completed problem {problem_number} for subject {subject_id}")
+            continue
 
-def run_experiment(settings = ExperimentSettings()):
-    logger.info("Running Experiment 2008")
-    logger_filename = ExperimentSettings.output_path + "/log.log"
-    logger.add(logger_filename, format="{time} {level} {message}", level="INFO", backtrace=True, diagnose=True, mode="w")
-    """Execute the full experiment with optional parallel execution."""
-    logger.info(f"Starting experiment with settings: {settings}")
+        # Run the problem
+        problem_results = run_problem(app, settings, problem, subject_id, problem_number)
+        all_results.extend(problem_results)
+
+        # Save results immediately if checkpointing per problem
+        if settings.checkpoint_per_problem:
+            pd.DataFrame(problem_results).to_csv(problem_file, index=False)
+            logger.info(f"Checkpoint saved: {problem_file}")
+
+    # Save results after all problems if checkpointing per subject
+    if not settings.checkpoint_per_problem and all_results:
+        subject_file = os.path.join(settings.output_path, f"{subject_id}.csv")
+        pd.DataFrame(all_results).to_csv(subject_file, index=False)
+        logger.info(f"Checkpoint saved: {subject_file}")
+
+def run_experiment(settings: ExperimentSettings = ExperimentSettings()):
+    """Execute the full experiment with flexible checkpointing."""
+    logger.info("Starting Experiment 2008")
     np.random.seed(settings.seed)
+
     df = load_data(settings)
     unique_subjects = df["Id"].unique()
-    logger.info(f"Unique subjects: {len(unique_subjects)}")
-    
-    subject_to_run_on = get_subject_to_run_on(settings, unique_subjects)
-    
+
     if settings.n_jobs == 1:
-        for subject_id in tqdm(subject_to_run_on, desc="Subjects"):
-            process_subject(settings, df, subject_id)
+        for subject_id in tqdm(unique_subjects, desc="Subjects"):
+            run_subject(settings, df[df["Id"] == subject_id], subject_id)
     else:
         Parallel(n_jobs=settings.n_jobs, backend="threading", verbose=True)(
-            delayed(process_subject)(settings, df[df["Id"] == subject_id].copy(), subject_id) for subject_id in tqdm(subject_to_run_on, desc="Subjects")
+            delayed(run_subject)(settings, df[df["Id"] == subject_id], subject_id) for subject_id in tqdm(unique_subjects, desc="Subjects")
         )
 
 if __name__ == "__main__":

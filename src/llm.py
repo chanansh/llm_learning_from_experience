@@ -16,16 +16,23 @@ from typing import List, Dict
 
 import openai
 from retry import retry
+from netnemo_ssa import AzureChatOpenAI
+from netnemo_ssa._azure_ad_token_provider import populate_gateway_tokens_in_env
+populate_gateway_tokens_in_env()
 
-def get_open_ai_chat_model(model: str = "gpt-4o-mini") -> ChatOpenAI:
+def get_open_ai_chat_model(model: str = "gpt-4o", azure=True) -> ChatOpenAI:
     """Load OpenAI chat model with environment variables."""
+    
     load_dotenv()
-    return ChatOpenAI(model=model)
+    if azure:
+        return AzureChatOpenAI(model=model) # using Nvidia's internal openai hosted model
+    else:
+        return ChatOpenAI(model=model) # using OpenAI's hosted model
 
 
 # https://python.langchain.com/docs/versions/migrating_memory/
 def get_memory_graph(
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-4o",
     summary_prompt: Optional[str] = "Summarize the key points of the conversation.",
     system_prompt: Optional[str] = "You are a helpful assistant.",
     max_history: int = 20,
@@ -110,12 +117,11 @@ def get_summarized_messages(
     """Generates a summary message and prepares the messages for invocation."""
     message_history = get_history(state)
     summary_message = generate_summary(model, message_history, summary_prompt)
-    logger.info(f"Summary: {summary_message.content}")
+    logger.info(f"Summary:\n{summary_message.content}")
     delete_messages = [RemoveMessage(id=m.id) for m in state["messages"]]
     human_message = HumanMessage(content=get_latest_human_message(state).content)
     response = model.invoke([summary_message, human_message])
     return [summary_message, human_message, response] + delete_messages
-
 
 def call_model(
     state: MessagesState,
@@ -133,20 +139,19 @@ def call_model(
         message_updates = get_summarized_messages(state=state, model=model, summary_prompt=summary_prompt)
     else:
         logger.info(f"Calling model with {number_of_messages} messages.")
-        message_updates = model.invoke(
-            insert_system_message(state["messages"], system_message)
-        )
+        prompt = insert_system_message(state["messages"], system_message)
+        message_updates = model.invoke(prompt)
 
     return {"messages": message_updates}
 
 
-@retry(tries=-1, delay=10, backoff=5, exceptions=(openai.RateLimitError,), logger=logger)
+@retry(tries=-1, delay=10, backoff=5, logger=logger)
 def invoke_graph(app: StateGraph, 
                  message: str, 
                  log_tokens: bool = True) -> str:
     """Helper method to interact with the LLM and log the input/output with retries."""
     
-    logger.info(f"Invoking LLM with message: {message}")
+    logger.info(f"Invoking LLM with message:\n{message}")
 
     try:
         response = app.invoke(dict(messages=[message]))
@@ -159,8 +164,8 @@ def invoke_graph(app: StateGraph,
 
         return ai_response
 
-    except openai.RateLimitError as e:
-        logger.warning(f"Rate limit reached, retrying... {str(e)}")
+    except Exception as e:
+        logger.warning(f"Error invoking graph... {str(e)}")
         raise
 
 def log_token_usage(response):
