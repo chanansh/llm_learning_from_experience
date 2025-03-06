@@ -42,11 +42,12 @@ class ExperimentSettings:
     n_trials: int = 100
     model: str = "gpt-4o"
     data_file: str = "artifacts/2008/estimation_data.csv"
-    output_path: str = "results/2008"
+    output_path: str = "results/2008/memory_inf"
     seed: int = 42
     llm_per_problem: bool = True
     checkpoint_per_problem: bool = True  # NEW FLAG: True = per problem, False = per subject
     n_jobs: int = 4
+    max_history: int = np.inf
 
 def load_data(settings: ExperimentSettings) -> pd.DataFrame:
     """Load and preprocess experiment data."""
@@ -90,7 +91,8 @@ def run_problem(app: Optional[StateGraph], settings: ExperimentSettings, problem
         app = get_memory_graph(
             model=settings.model,
             summary_prompt=settings.summary_prompt,
-            system_prompt=settings.instructions
+            system_prompt=settings.instructions,
+            max_history=settings.max_history
         )
 
     # Start the game and ask for the first decision
@@ -140,7 +142,8 @@ def run_subject(settings: ExperimentSettings, df_id: pd.DataFrame, subject_id: i
     app = None if settings.llm_per_problem else get_memory_graph(
         model=settings.model,
         summary_prompt=settings.summary_prompt,
-        system_prompt=settings.instructions
+        system_prompt=settings.instructions,
+        max_history=settings.max_history
     )
 
     all_results = []
@@ -171,6 +174,7 @@ def run_subject(settings: ExperimentSettings, df_id: pd.DataFrame, subject_id: i
 def run_experiment(settings: ExperimentSettings = ExperimentSettings()):
     """Execute the full experiment with flexible checkpointing."""
     logger.info("Starting Experiment 2008")
+    os.makedirs(settings.output_path, exist_ok=True)
     np.random.seed(settings.seed)
 
     df = load_data(settings)
